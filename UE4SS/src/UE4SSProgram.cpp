@@ -578,9 +578,16 @@ namespace RC
 
             UE4SS_DBG( "[UE4SS] Installing C++ mods...\n");
             install_cpp_mods();
+#ifdef __linux__
+            // On Linux, defer starting C++ mods until after setup_unreal() has resolved
+            // UE function addresses (GUObjectArray, ProcessEvent, etc.). C++ mods like
+            // PalSentinel need these addresses in their start_mod() function.
+            UE4SS_DBG( "[UE4SS] Deferring C++ mod start until after setup_unreal() on Linux...\n");
+#else
             UE4SS_DBG( "[UE4SS] Starting C++ mods...\n");
             start_cpp_mods(IsInitialStartup::Yes);
             UE4SS_DBG( "[UE4SS] C++ mods started.\n");
+#endif
 
             if (m_has_game_specific_config)
             {
@@ -662,6 +669,14 @@ namespace RC
         try
         {
             setup_unreal();
+
+#ifdef __linux__
+            // Now that setup_unreal() has resolved UE addresses, start C++ mods
+            // (deferred from constructor on Linux to avoid crashes when mods need UE addresses)
+            UE4SS_DBG( "[UE4SS] Starting C++ mods (deferred, post setup_unreal)...\n");
+            start_cpp_mods(IsInitialStartup::Yes);
+            UE4SS_DBG( "[UE4SS] C++ mods started.\n");
+#endif
 
             Output::send(STR("Unreal Engine modules ({}):\n"), SigScannerStaticData::m_is_modular ? STR("modular") : STR("non-modular"));
             auto& main_exe_ptr = SigScannerStaticData::m_modules_info.array[static_cast<size_t>(ScanTarget::MainExe)].lpBaseOfDll;
@@ -2672,9 +2687,10 @@ namespace RC
             // UE function addresses (GUObjectArray, ProcessInternal, etc.) for hook registration
             // and the UObjectArray delete listener. Only call them if address resolution succeeded
             // (via dlsym on unstripped binaries or manual UE4SS_Addresses.ini overrides).
-            if (Unreal::GUObjectArray && Unreal::UObjectArray::GetNumElements() > 0)
+            if (Unreal::GUObjectArray && Unreal::UObjectArray::GetNumElements() >= 1000)
             {
-                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray resolved, calling LuaMod::on_program_start() and fire_program_start_for_cpp_mods()...\n");
+                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray resolved with %d elements, calling LuaMod::on_program_start() and fire_program_start_for_cpp_mods()...\n",
+                          (int)Unreal::UObjectArray::GetNumElements());
                 TRY([&] { LuaMod::on_program_start(); });
                 TRY([&] { fire_program_start_for_cpp_mods(); });
 
@@ -2684,11 +2700,25 @@ namespace RC
             }
             else
             {
-                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray not resolved, skipping LuaMod::on_program_start(), fire_program_start_for_cpp_mods(), and start_lua_mods() (stripped binary, no addresses)\n");
-                Output::send<LogLevel::Warning>(STR("WARNING: GUObjectArray not resolved (stripped binary). Lua mods will NOT be started because they require UE function addresses. Provide a UE4SS_Addresses.ini with manual addresses to enable mod functionality.\n"));
+                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray has only %d elements (need >= 1000), starting Lua mods without hooks\n",
+                          Unreal::GUObjectArray ? (int)Unreal::UObjectArray::GetNumElements() : -1);
+                Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray has only {} elements (need >= 1000). Starting Lua mods without UE hooks. Some mod features may not work.\n"),
+                    Unreal::GUObjectArray ? Unreal::UObjectArray::GetNumElements() : 0);
+                // Still try to start Lua mods — they may work partially without hooks
+                UE4SS_DBG( "[UE4SS] Linux: calling start_lua_mods() (limited mode)...\n");
+                TRY([&] { start_lua_mods(); });
+                UE4SS_DBG( "[UE4SS] Linux: start_lua_mods() done (limited mode).\n");
             }
 
-            ObjectDumper::init();
+            // Skip ObjectDumper::init() in limited mode — it iterates GUObjectArray
+            if (Unreal::GUObjectArray && Unreal::UObjectArray::GetNumElements() >= 1000)
+            {
+                ObjectDumper::init();
+            }
+            else
+            {
+                UE4SS_DBG( "[UE4SS] Linux: Skipping ObjectDumper::init() (limited mode)\n");
+            }
             if (settings_manager.General.EnableHotReloadSystem)
             {
 #ifdef HAS_INPUT
@@ -2709,10 +2739,16 @@ namespace RC
             UE4SS_DBG("[UE4SS] Linux: GUObjectArray not resolved, skipping post-setup_unreal init (output_all_member_offsets, fire_unreal_init, setup_unreal_properties, event loop)\n");
             return;
         }
-        if (Unreal::UObjectArray::GetNumElements() == 0)
+        if (Unreal::UObjectArray::GetNumElements() < 1000)
         {
-            UE4SS_DBG("[UE4SS] Linux: GUObjectArray has 0 elements (wrong address from heuristic scan), skipping post-setup_unreal init\n");
-            Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray address appears invalid (0 elements). Mod functionality will be limited.\n"));
+            UE4SS_DBG("[UE4SS] Linux: GUObjectArray has only %d elements (need >= 1000), skipping post-setup_unreal init\n",
+                      (int)Unreal::UObjectArray::GetNumElements());
+            Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray has only {} elements. Mod functionality will be limited.\n"),
+                Unreal::UObjectArray::GetNumElements());
+            // Start the event loop so the server keeps running
+            UE4SS_DBG("[UE4SS] Linux: Starting event loop (limited mode)...\n");
+            m_event_loop = std::jthread{&UE4SSProgram::update, this};
+            m_event_loop.join();
             return;
         }
 #endif

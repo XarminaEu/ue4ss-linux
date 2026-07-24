@@ -851,13 +851,31 @@ namespace RC::Unreal::UnrealInitializer
         Output::send(STR("Waiting for object construction...\n"));
         {
             auto wait_start = std::chrono::steady_clock::now();
-            while (UObjectArray::GetNumElements() < 10000)
+#ifdef __linux__
+            // On Linux with stripped binaries, GUObjectArray may have very few elements
+            // because the engine hasn't fully initialized yet. Don't block — just proceed.
+            const int32_t min_elements = 0;
+            const int timeout_seconds = 5;
+#else
+            const int32_t min_elements = 10000;
+            const int timeout_seconds = 60;
+#endif
+            while (UObjectArray::GetNumElements() < min_elements)
             {
-                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - wait_start).count() > 60)
+                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - wait_start).count() > timeout_seconds)
                 {
                     Output::send<LogLevel::Warning>(STR("Timeout waiting for object construction ({} elements). Continuing with limited FName support.\n"), UObjectArray::GetNumElements());
                     break;
                 }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#ifdef __linux__
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - wait_start).count();
+                if (elapsed % 10 == 0 && elapsed > 0)
+                {
+                    fprintf(stderr, "[UE4SS] Waiting for object construction: %d elements (elapsed %lds)\n",
+                            (int)UObjectArray::GetNumElements(), (long)elapsed);
+                }
+#endif
             }
         }
 #ifdef __linux__
@@ -876,6 +894,12 @@ namespace RC::Unreal::UnrealInitializer
         // Consider adding a limit to how long we can wait.
         Output::send(STR("Locating KismetSystemLibrary...\n"));
         UClass* KismetStringLibrary{};
+#ifdef __linux__
+        // On Linux with stripped binaries, StaticFindObject may crash if GUObjectArray
+        // has very few elements (engine not fully initialized). Skip and use fallback.
+        if (UObjectArray::GetNumElements() >= 1000)
+        {
+#endif
         {
             auto wait_start = std::chrono::steady_clock::now();
             while (!KismetStringLibrary)
@@ -892,6 +916,14 @@ namespace RC::Unreal::UnrealInitializer
                 }
             }
         }
+#ifdef __linux__
+        }
+        else
+        {
+            fprintf(stderr, "[UE4SS] Skipping KismetStringLibrary lookup (GUObjectArray has only %d elements)\n",
+                    (int)UObjectArray::GetNumElements());
+        }
+#endif
         // For some games, it's found in GUObjectArray, and in other games, it's found in the function linked list.
         Output::send(STR("Locating KismetSystemLibrary:Conv_NameToString...\n"));
         {
@@ -931,6 +963,21 @@ namespace RC::Unreal::UnrealInitializer
                 }
             }
         }
+
+#ifdef __linux__
+        // On Linux with stripped binaries, if GUObjectArray has very few elements,
+        // the engine hasn't fully initialized and object iteration will crash.
+        // Skip the remaining PostInitialize (required objects, hooks) and continue
+        // with limited functionality. Lua mods can still start without hooks.
+        if (UObjectArray::GetNumElements() < 1000)
+        {
+            fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has only %d elements, skipping PostInitialize (hooks/required objects)\n",
+                    (int)UObjectArray::GetNumElements());
+            Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray has only {} elements. Hooks and required object checks skipped. Mods will have limited functionality.\n"), UObjectArray::GetNumElements());
+            StaticStorage::bIsInitialized = true;
+            return;
+        }
+#endif
 
         // Objects that are required to exist before we can continue
         Hook::AddRequiredObject({STR("/Script/CoreUObject"), STR("Class")});
