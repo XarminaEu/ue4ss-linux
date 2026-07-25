@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <funchook.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <setjmp.h>
 #endif
 
 #include <algorithm>
@@ -97,6 +100,14 @@
 
 #ifdef __linux__
 extern "C" bool ue4ss_with_crash_recovery(const std::function<void()>& func);
+// Heap scan SIGSEGV recovery (accessed by signal handler in main_linux.cpp)
+thread_local sigjmp_buf s_scan_jmpbuf;
+thread_local bool s_has_scan_jmpbuf = false;
+// Direct memory read for NumElements — bypasses MemberOffsets lookup which crashes on Linux
+static int32_t linux_get_num_elements() {
+    if (!RC::Unreal::GUObjectArray) return 0;
+    return *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(RC::Unreal::GUObjectArray) + 0x24);
+}
 #endif
 
 namespace RC
@@ -671,11 +682,21 @@ namespace RC
             setup_unreal();
 
 #ifdef __linux__
-            // Now that setup_unreal() has resolved UE addresses, start C++ mods
-            // (deferred from constructor on Linux to avoid crashes when mods need UE addresses)
-            UE4SS_DBG( "[UE4SS] Starting C++ mods (deferred, post setup_unreal)...\n");
-            start_cpp_mods(IsInitialStartup::Yes);
-            UE4SS_DBG( "[UE4SS] C++ mods started.\n");
+            // C++ mods are now started inside setup_unreal() (both full and limited mode paths).
+            // Previously, start_cpp_mods() was called here but setup_unreal() started the event loop
+            // and blocked forever, so this code was never reached.
+            //
+            // On Linux, always use limited mode for post-init: MemberOffsets lookup crashes
+            // even when GUObjectArray was found (stripped binary, no FName::ToString for offset names).
+            // fire_unreal_init_for_cpp_mods() and setup_unreal_properties() would crash.
+            // Start the event loop directly so the server keeps running and C++ mods stay active.
+            {
+                UE4SS_DBG( "[UE4SS] Linux: starting event loop (limited mode, no UE post-init).\n");
+                fprintf(stderr, "[UE4SS] Linux: starting event loop (limited mode, no UE post-init).\n");
+                m_event_loop = std::jthread{&UE4SSProgram::update, this};
+                m_event_loop.join();
+                return;
+            }
 #endif
 
             Output::send(STR("Unreal Engine modules ({}):\n"), SigScannerStaticData::m_is_modular ? STR("modular") : STR("non-modular"));
@@ -1055,8 +1076,8 @@ namespace RC
                         return segs;
                     };
 
-                    // Real is_readable: parse /proc/self/maps once and cache
-                    struct MapsRange { uintptr_t start; uintptr_t end; };
+                    // Real is_readable: parse /proc/self/maps and check read permission
+                    struct MapsRange { uintptr_t start; uintptr_t end; bool readable; bool writable; bool anonymous; bool is_heap; };
                     std::vector<MapsRange> g_maps_ranges;
                     auto load_maps = [&]() {
                         g_maps_ranges.clear();
@@ -1065,8 +1086,29 @@ namespace RC
                         char line[512];
                         while (fgets(line, sizeof(line), f)) {
                             uintptr_t start, end;
-                            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-                                g_maps_ranges.push_back({start, end});
+                            char perms[8] = {};
+                            // Format: start-end perms offset dev inode pathname
+                            // Parse perms and pathname
+                            if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3) {
+                                bool is_readable = perms[0] == 'r';
+                                bool is_writable = perms[1] == 'w';
+                                // Check if anonymous (no file path, or [heap], or [anon:...])
+                                bool is_anon = false;
+                                bool is_heap_region = false;
+                                char* newline = strchr(line, '\n');
+                                if (newline) *newline = '\0';
+                                if (strstr(line, "[heap]")) {
+                                    is_heap_region = true;
+                                    is_anon = true;
+                                } else if (strstr(line, "[anon")) {
+                                    is_anon = true;
+                                } else {
+                                    char* path_start = strstr(line, " /");
+                                    if (!path_start) {
+                                        is_anon = true;
+                                    }
+                                }
+                                g_maps_ranges.push_back({start, end, is_readable, is_writable, is_anon, is_heap_region});
                             }
                         }
                         fclose(f);
@@ -1075,12 +1117,20 @@ namespace RC
                         if (addr < 0x10000 || addr > 0x7fffffffffff) return false;
                         uintptr_t end = addr + len;
                         for (const auto& r : g_maps_ranges) {
-                            if (addr >= r.start && end <= r.end) return true;
+                            if (r.readable && addr >= r.start && end <= r.end) return true;
                         }
                         return false;
                     };
 
+                    // Fallback: use is_readable only. The existing SIGSEGV handler will catch
+                    // any rare stale-map crashes. Using mincore/msync caused more problems than it solved.
+                    auto is_readable_safe = [&](uintptr_t addr, size_t len) -> bool {
+                        return is_readable(addr, len);
+                    };
+
                     auto validate_fuobjectarray = [&](uint8_t* candidate) -> bool {
+                        // Check that the entire struct is readable (with msync for safety)
+                        if (!is_readable_safe(reinterpret_cast<uintptr_t>(candidate), 0xB8)) return false;
                         int32_t obj_first_gc = *reinterpret_cast<int32_t*>(candidate + 0x00);
                         if (obj_first_gc < 0 || obj_first_gc > 1000000) return false;
 
@@ -1095,15 +1145,15 @@ namespace RC
 
                         void* objects_ptr = *reinterpret_cast<void**>(candidate + 0x10);
                         if (objects_ptr == nullptr) return false;
-                        if (!is_readable(reinterpret_cast<uintptr_t>(objects_ptr), 8)) return false;
+                        if (!is_readable_safe(reinterpret_cast<uintptr_t>(objects_ptr), 8)) return false;
 
                         void* pre_alloc = *reinterpret_cast<void**>(candidate + 0x18);
                         if (pre_alloc != nullptr) {
-                            if (!is_readable(reinterpret_cast<uintptr_t>(pre_alloc), 8)) return false;
+                            if (!is_readable_safe(reinterpret_cast<uintptr_t>(pre_alloc), 8)) return false;
                         }
 
                         int32_t max_elements = *reinterpret_cast<int32_t*>(candidate + 0x20);
-                        if (max_elements <= 0 || max_elements > 10000000) return false;
+                        if (max_elements < 100 || max_elements > 10000000) return false;
 
                         int32_t num_elements = *reinterpret_cast<int32_t*>(candidate + 0x24);
                         if (num_elements < 1 || num_elements > max_elements) return false;
@@ -1118,16 +1168,20 @@ namespace RC
 
                         Unreal::FUObjectItem** chunks = *reinterpret_cast<Unreal::FUObjectItem***>(candidate + 0x10);
                         if (chunks == nullptr) return false;
-                        if (!is_readable(reinterpret_cast<uintptr_t>(chunks), 8)) return false;
+                        if (!is_readable_safe(reinterpret_cast<uintptr_t>(chunks), 8)) return false;
 
                         void* first_chunk = *reinterpret_cast<void* volatile*>(chunks);
                         if (first_chunk == nullptr) return false;
-                        if (!is_readable(reinterpret_cast<uintptr_t>(first_chunk), 64)) return false;
+                        if (!is_readable_safe(reinterpret_cast<uintptr_t>(first_chunk), 64)) return false;
 
                         // Verify first element in first chunk looks like a UObject pointer
                         void* first_obj = *reinterpret_cast<void* volatile*>(first_chunk);
                         if (first_obj == nullptr) return false;
-                        if (!is_readable(reinterpret_cast<uintptr_t>(first_obj), 64)) return false;
+                        if (!is_readable_safe(reinterpret_cast<uintptr_t>(first_obj), 64)) return false;
+                        // Check that first_obj has a valid vtable pointer (first 8 bytes should be a readable pointer)
+                        void* vtable = *reinterpret_cast<void* volatile*>(first_obj);
+                        if (vtable == nullptr) return false;
+                        if (!is_readable_safe(reinterpret_cast<uintptr_t>(vtable), 8)) return false;
 
                         return true;
                     };
@@ -1154,6 +1208,9 @@ namespace RC
                         };
 
                         std::set<uintptr_t> checked;
+                        // Time limit for code scan to avoid spending too long
+                        auto scan_start = std::chrono::steady_clock::now();
+                        constexpr int SCAN_TIME_LIMIT_MS = 10000; // 10 seconds max
 
                         for (const auto& seg : segs) {
                             if (!seg.executable) continue;
@@ -1162,6 +1219,14 @@ namespace RC
                             // mov reg, [rip+disp32]: 48 8B xx xx xx xx xx (7 bytes)
                             // Also: 4C 8D / 4C 8B for r8-r15
                             for (size_t offset = 0; offset + 7 < seg.size; offset++) {
+                                // Check time limit periodically
+                                if ((offset & 0xFFFFF) == 0) {
+                                    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - scan_start).count() > SCAN_TIME_LIMIT_MS) {
+                                        UE4SS_DBG("[UE4SS] Code scan: time limit exceeded (%dms), aborting\n", SCAN_TIME_LIMIT_MS);
+                                        return nullptr;
+                                    }
+                                }
                                 uint8_t* p = seg.start + offset;
                                 uint8_t b0 = p[0], b1 = p[1], b2 = p[2];
 
@@ -1192,14 +1257,40 @@ namespace RC
                                         return reinterpret_cast<void*>(candidate);
                                     }
                                 }
+
+                                // If direct validation failed, try treating the target as a POINTER
+                                // to GUObjectArray (common on Linux/PIE: .data has a pointer that
+                                // points to the actual struct on the heap).
+                                if (is_readable(target, 8)) {
+                                    void* ptr_val = *reinterpret_cast<void**>(target);
+                                    if (ptr_val && reinterpret_cast<uintptr_t>(ptr_val) > 0x10000 &&
+                                        reinterpret_cast<uintptr_t>(ptr_val) < 0x7fffffffffff &&
+                                        is_readable(reinterpret_cast<uintptr_t>(ptr_val), 0xB8)) {
+                                        uint8_t* ptr_candidate = reinterpret_cast<uint8_t*>(ptr_val);
+                                        if (validate_fuobjectarray(ptr_candidate)) {
+                                            UE4SS_DBG("[UE4SS] Code scan: valid GUObjectArray at %p (via pointer at %p, from ref at %p)\n",
+                                                      ptr_candidate, reinterpret_cast<void*>(target), p);
+                                            return reinterpret_cast<void*>(ptr_candidate);
+                                        }
+                                        // Also try offsets from the dereferenced pointer
+                                        for (int off = 0; off <= 0x20; off += 0x8) {
+                                            uint8_t* cand = ptr_candidate - off;
+                                            if (validate_fuobjectarray(cand)) {
+                                                UE4SS_DBG("[UE4SS] Code scan: valid GUObjectArray at %p (via ptr at %p, offset -0x%X, from ref at %p)\n",
+                                                          cand, reinterpret_cast<void*>(target), off, p);
+                                                return reinterpret_cast<void*>(cand);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         return nullptr;
                     };
 
                     void* found_addr = nullptr;
-                    constexpr int MAX_RETRIES = 60;
-                    constexpr int RETRY_DELAY_MS = 500;
+                    constexpr int MAX_RETRIES = 120;
+                    constexpr int RETRY_DELAY_MS = 1000;
 
                     for (int attempt = 0; attempt < MAX_RETRIES && !found_addr; attempt++)
                     {
@@ -1217,11 +1308,14 @@ namespace RC
                         }
 
                         // Phase 1: Code-based scan (find RIP-relative refs to writable data)
+                        // Skip on Linux — too slow (126MB) and never finds anything on stripped PIE binaries
+#ifndef __linux__
                         if (attempt == 0)
                         {
                             UE4SS_DBG( "[UE4SS] Heuristic scan: starting code-based scan...\n");
                         }
                         found_addr = scan_code_refs(segments);
+#endif
 
                         // Phase 2: Data-based scan (fallback: scan writable segments directly)
                         if (!found_addr)
@@ -1236,10 +1330,109 @@ namespace RC
                                 for (size_t offset = 0; offset + 0xB8 <= seg.size; offset += 8)
                                 {
                                     uint8_t* candidate = seg.start + offset;
+                                    // Quick pre-filter: check max_elements first to avoid full validation
+                                    int32_t me = *reinterpret_cast<int32_t*>(candidate + 0x20);
+                                    if (me < 100 || me > 10000000) continue;
+                                    int32_t ne = *reinterpret_cast<int32_t*>(candidate + 0x24);
+                                    if (ne < 1 || ne > me) continue;
+                                    // Log candidates that pass the quick filter (only first attempt and periodically)
+                                    if (attempt == 0 && (ne > 1000 || (me >= 10000 && me <= 200000 && ne > 100))) {
+                                        UE4SS_DBG("[UE4SS] Data scan: candidate at %p (max_el=%d, num_el=%d, attempt %d)\n",
+                                                  candidate, me, ne, attempt);
+                                    }
+                                    // For high-element candidates, log detailed validation info
+                                    if (ne > 1000 && ne < 1000000 && attempt <= 5) {
+                                        void* op = *reinterpret_cast<void**>(candidate + 0x10);
+                                        void* pa = *reinterpret_cast<void**>(candidate + 0x18);
+                                        int32_t mc = *reinterpret_cast<int32_t*>(candidate + 0x28);
+                                        int32_t nc = *reinterpret_cast<int32_t*>(candidate + 0x2C);
+                                        UE4SS_DBG("[UE4SS] Data scan: detailed candidate at %p: objects_ptr=%p, pre_alloc=%p, max_chunks=%d, num_chunks=%d\n",
+                                                  candidate, op, pa, mc, nc);
+                                        if (op && is_readable(reinterpret_cast<uintptr_t>(op), 8)) {
+                                            void* fc = *reinterpret_cast<void* volatile*>(op);
+                                            UE4SS_DBG("[UE4SS] Data scan: first_chunk=%p (readable=%d)\n",
+                                                      fc, fc ? is_readable(reinterpret_cast<uintptr_t>(fc), 64) : 0);
+                                            if (fc && is_readable(reinterpret_cast<uintptr_t>(fc), 64)) {
+                                                void* fo = *reinterpret_cast<void* volatile*>(fc);
+                                                UE4SS_DBG("[UE4SS] Data scan: first_obj=%p (readable=%d)\n",
+                                                          fo, fo ? is_readable(reinterpret_cast<uintptr_t>(fo), 64) : 0);
+                                                if (fo && is_readable(reinterpret_cast<uintptr_t>(fo), 64)) {
+                                                    void* vt = *reinterpret_cast<void* volatile*>(fo);
+                                                    UE4SS_DBG("[UE4SS] Data scan: vtable=%p (readable=%d)\n",
+                                                              vt, vt ? is_readable(reinterpret_cast<uintptr_t>(vt), 8) : 0);
+                                                }
+                                            }
+                                        }
+                                    }
                                     if (validate_fuobjectarray(candidate))
                                     {
                                         found_addr = candidate;
                                         UE4SS_DBG( "[UE4SS] Heuristic scan: FUObjectArray candidate found at %p (segment offset 0x%zx, attempt %d)\n", found_addr, offset, attempt);
+                                        break;
+                                    }
+                                }
+                                if (found_addr) break;
+                            }
+                        }
+
+                        // Phase 3: Scan ALL writable memory regions (including heap)
+                        // The FUObjectArray struct may be allocated on the heap by the engine.
+                        if (!found_addr)
+                        {
+                            // Reload maps to get fresh memory layout (heap may have grown)
+                            load_maps();
+                            // Copy ranges to avoid iterator invalidation when we reload maps inside the loop
+                            auto ranges_copy = g_maps_ranges;
+                            if (attempt == 0 || attempt % 10 == 0)
+                            {
+                                UE4SS_DBG("[UE4SS] Heuristic scan: trying all writable memory regions (heap scan)...\n");
+                            }
+                            for (const auto& r : ranges_copy)
+                            {
+                                if (!r.readable || !r.writable) continue;
+                                if (!r.anonymous) continue;
+                                size_t region_size = r.end - r.start;
+                                // Skip very small or very large regions
+                                if (region_size < 0x1000 || region_size > 0x10000000) continue;
+                                // Skip regions that are part of the main exe (already scanned)
+                                bool is_main_exe = false;
+                                for (const auto& seg : segments) {
+                                    if (r.start >= reinterpret_cast<uintptr_t>(seg.start) &&
+                                        r.end <= reinterpret_cast<uintptr_t>(seg.start + seg.size)) {
+                                        is_main_exe = true;
+                                        break;
+                                    }
+                                }
+                                if (is_main_exe) continue;
+
+                                // Reload maps and verify this region still exists (may have been unmapped)
+                                load_maps();
+                                bool region_still_valid = false;
+                                for (const auto& r2 : g_maps_ranges) {
+                                    if (r2.start == r.start && r2.end == r.end && r2.readable) {
+                                        region_still_valid = true;
+                                        break;
+                                    }
+                                }
+                                if (!region_still_valid) continue;
+
+                                uint8_t* region_start = reinterpret_cast<uint8_t*>(r.start);
+                                UE4SS_DBG("[UE4SS] Heuristic scan: scanning region 0x%lx-0x%lx (%zu bytes)\n",
+                                          r.start, r.end, region_size);
+                                for (size_t offset = 0; offset + 0xB8 <= region_size; offset += 8)
+                                {
+                                    uint8_t* candidate = region_start + offset;
+                                    // Quick pre-filter
+                                    int32_t me = *reinterpret_cast<int32_t*>(candidate + 0x20);
+                                    if (me < 100 || me > 500000) continue;
+                                    int32_t ne = *reinterpret_cast<int32_t*>(candidate + 0x24);
+                                    if (ne < 100 || ne > me) continue;
+                                    // Full validation
+                                    if (validate_fuobjectarray(candidate))
+                                    {
+                                        found_addr = candidate;
+                                        UE4SS_DBG("[UE4SS] Heuristic scan: FUObjectArray found at %p (in region 0x%lx-0x%lx, attempt %d, num_el=%d)\n",
+                                                  found_addr, r.start, r.end, attempt, ne);
                                         break;
                                     }
                                 }
@@ -1751,21 +1944,12 @@ namespace RC
                         const uint8_t pattern3[] = { 0x48, 0x89, 0xF3, 0x48, 0x89, 0xD6, 0xE8 };
                         // Pattern 4: mov rdi, rsi; mov rsi, rdx; call (no save, direct pass)
                         const uint8_t pattern4[] = { 0x48, 0x89, 0xF7, 0x48, 0x89, 0xD6, 0xE8 };
-                        // Pattern 5 (fallback): mov rbx, rdi; mov rdi, rsi; call (old pattern,
-                        // may match accessor but better than nothing on stripped binaries)
-                        const uint8_t pattern5[] = { 0x48, 0x89, 0xFB, 0x48, 0x89, 0xF7, 0xE8 };
-                        // Pattern 6: mov rdi, rsi; mov rdx, rdx (nop); call — just mov rdi,rsi near a call
-                        // Try: 49 89 F0 48 89 F7 E8 (mov r8, rsi; mov rdi, rsi; call) — uncommon but possible
-                        const uint8_t pattern6[] = { 0x49, 0x89, 0xF0, 0x48, 0x89, 0xF7, 0xE8 };
-
                         struct AOBPattern { const uint8_t* bytes; size_t len; const char* name; };
                         AOBPattern patterns[] = {
                             { pattern1, sizeof(pattern1), "mov rbx,rsi; mov rdi,rdx; call" },
                             { pattern2, sizeof(pattern2), "mov rbp,rsi; mov rdi,rdx; call" },
                             { pattern3, sizeof(pattern3), "mov rbx,rsi; mov rsi,rdx; call" },
                             { pattern4, sizeof(pattern4), "mov rdi,rsi; mov rsi,rdx; call" },
-                            { pattern5, sizeof(pattern5), "mov rbx,rdi; mov rdi,rsi; call (fallback)" },
-                            { pattern6, sizeof(pattern6), "mov r8,rsi; mov rdi,rsi; call" },
                         };
                         // Look for this pattern a few bytes before the actual function start
                         // (after the prologue saves). We scan backwards from the pattern match
@@ -1779,7 +1963,7 @@ namespace RC
                             {
                                 // Try each pattern
                                 int matched_pattern = -1;
-                                for (int p = 0; p < 6; p++)
+                                for (int p = 0; p < 4; p++)
                                 {
                                     if (offset + patterns[p].len <= seg.size &&
                                         memcmp(seg.start + offset, patterns[p].bytes, patterns[p].len) == 0)
@@ -2687,10 +2871,12 @@ namespace RC
             // UE function addresses (GUObjectArray, ProcessInternal, etc.) for hook registration
             // and the UObjectArray delete listener. Only call them if address resolution succeeded
             // (via dlsym on unstripped binaries or manual UE4SS_Addresses.ini overrides).
-            if (Unreal::GUObjectArray && Unreal::UObjectArray::GetNumElements() >= 1000)
+            // On Linux with stripped binaries, MemberOffsets lookup crashes, so always use limited mode.
+            if (Unreal::GUObjectArray && linux_get_num_elements() >= 0x7FFFFFFF)
             {
-                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray resolved with %d elements, calling LuaMod::on_program_start() and fire_program_start_for_cpp_mods()...\n",
-                          (int)Unreal::UObjectArray::GetNumElements());
+                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray resolved with %d elements, calling start_cpp_mods(), LuaMod::on_program_start() and fire_program_start_for_cpp_mods()...\n",
+                          linux_get_num_elements());
+                TRY([&] { start_cpp_mods(IsInitialStartup::Yes); });
                 TRY([&] { LuaMod::on_program_start(); });
                 TRY([&] { fire_program_start_for_cpp_mods(); });
 
@@ -2700,25 +2886,27 @@ namespace RC
             }
             else
             {
-                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray has only %d elements (need >= 1000), starting Lua mods without hooks\n",
-                          Unreal::GUObjectArray ? (int)Unreal::UObjectArray::GetNumElements() : -1);
-                Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray has only {} elements (need >= 1000). Starting Lua mods without UE hooks. Some mod features may not work.\n"),
-                    Unreal::GUObjectArray ? Unreal::UObjectArray::GetNumElements() : 0);
+                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray has only %d elements, starting Lua mods without hooks\n",
+                          Unreal::GUObjectArray ? linux_get_num_elements() : -1);
+                fprintf(stderr, "[UE4SS] Linux limited mode: GUObjectArray has only %d elements. Starting mods without UE hooks. Some mod features may not work.\n",
+                    Unreal::GUObjectArray ? linux_get_num_elements() : 0);
+                // Start C++ mods FIRST — start_mod() must be called before fire_program_start_for_cpp_mods()
+                // otherwise on_program_start() is called on a null m_mod pointer.
+                UE4SS_DBG( "[UE4SS] Linux: calling start_cpp_mods() (limited mode)...\n");
+                TRY([&] { start_cpp_mods(IsInitialStartup::Yes); });
+                UE4SS_DBG( "[UE4SS] Linux: start_cpp_mods() done.\n");
+                UE4SS_DBG( "[UE4SS] Linux: calling fire_program_start_for_cpp_mods() (limited mode)...\n");
+                TRY([&] { fire_program_start_for_cpp_mods(); });
+                UE4SS_DBG( "[UE4SS] Linux: fire_program_start_for_cpp_mods() done.\n");
                 // Still try to start Lua mods — they may work partially without hooks
                 UE4SS_DBG( "[UE4SS] Linux: calling start_lua_mods() (limited mode)...\n");
                 TRY([&] { start_lua_mods(); });
                 UE4SS_DBG( "[UE4SS] Linux: start_lua_mods() done (limited mode).\n");
             }
 
-            // Skip ObjectDumper::init() in limited mode — it iterates GUObjectArray
-            if (Unreal::GUObjectArray && Unreal::UObjectArray::GetNumElements() >= 1000)
-            {
-                ObjectDumper::init();
-            }
-            else
-            {
-                UE4SS_DBG( "[UE4SS] Linux: Skipping ObjectDumper::init() (limited mode)\n");
-            }
+            // Skip ObjectDumper::init() on Linux — it iterates GUObjectArray which crashes
+            // due to MemberOffsets lookup with wide strings
+            UE4SS_DBG( "[UE4SS] Linux: Skipping ObjectDumper::init() (limited mode)\n");
             if (settings_manager.General.EnableHotReloadSystem)
             {
 #ifdef HAS_INPUT
@@ -2734,23 +2922,9 @@ namespace RC
 #endif
 
 #ifdef __linux__
-        if (!Unreal::GUObjectArray)
-        {
-            UE4SS_DBG("[UE4SS] Linux: GUObjectArray not resolved, skipping post-setup_unreal init (output_all_member_offsets, fire_unreal_init, setup_unreal_properties, event loop)\n");
-            return;
-        }
-        if (Unreal::UObjectArray::GetNumElements() < 1000)
-        {
-            UE4SS_DBG("[UE4SS] Linux: GUObjectArray has only %d elements (need >= 1000), skipping post-setup_unreal init\n",
-                      (int)Unreal::UObjectArray::GetNumElements());
-            Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray has only {} elements. Mod functionality will be limited.\n"),
-                Unreal::UObjectArray::GetNumElements());
-            // Start the event loop so the server keeps running
-            UE4SS_DBG("[UE4SS] Linux: Starting event loop (limited mode)...\n");
-            m_event_loop = std::jthread{&UE4SSProgram::update, this};
-            m_event_loop.join();
-            return;
-        }
+        // On Linux, always return from setup_unreal() after the TRY block.
+        // The event loop and post-init are handled by init().
+        return;
 #endif
 
         output_all_member_offsets(IsCoalesced::Yes);

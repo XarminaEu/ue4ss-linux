@@ -119,11 +119,14 @@ namespace RC
     {
         try
         {
+            fprintf(stderr, "[UE4SS] CppMod::start_mod: calling m_start_mod_func for '%s'...\n", ensure_str(m_mod_name).c_str());
             m_mod = m_start_mod_func();
+            fprintf(stderr, "[UE4SS] CppMod::start_mod: m_start_mod_func returned %p for '%s'\n", (void*)m_mod, ensure_str(m_mod_name).c_str());
             m_is_started = m_mod != nullptr;
         }
         catch (std::exception& e)
         {
+            fprintf(stderr, "[UE4SS] CppMod::start_mod: exception for '%s': %s\n", ensure_str(m_mod_name).c_str(), e.what());
             if (!Output::has_internal_error())
             {
                 Output::send<LogLevel::Warning>(STR("Failed to load library <{}> for mod {}, because: {}\n"),

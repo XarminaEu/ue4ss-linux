@@ -87,6 +87,9 @@ static thread_local bool s_has_jmpbuf = false;
 // Per-mod SIGSEGV recovery (checked first by signal handler)
 static thread_local sigjmp_buf s_mod_jmpbuf;
 static thread_local bool s_has_mod_jmpbuf = false;
+// Heap scan SIGSEGV recovery (checked before init recovery)
+extern thread_local sigjmp_buf s_scan_jmpbuf;
+extern thread_local bool s_has_scan_jmpbuf;
 static struct sigaction s_old_sigsegv;
 static struct sigaction s_old_sigbus;
 
@@ -99,6 +102,13 @@ static void ue4ss_sigsegv_handler(int sig, siginfo_t* info, void* ucontext)
         UE4SS_ERR("[UE4SS] Caught signal %d during mod execution, recovering...\n", sig);
         s_has_mod_jmpbuf = false;
         siglongjmp(s_mod_jmpbuf, sig);
+    }
+    // Check heap scan recovery
+    if (s_has_scan_jmpbuf)
+    {
+        UE4SS_ERR("[UE4SS] Caught signal %d during heap scan, recovering...\n", sig);
+        s_has_scan_jmpbuf = false;
+        siglongjmp(s_scan_jmpbuf, sig);
     }
     if (s_has_jmpbuf)
     {
@@ -161,10 +171,10 @@ static auto wait_for_game_ready() -> void
     // UE5 games (like Palworld) need significant time to load.
     // We wait in stages and check if the game is still alive.
     UE4SS_DBG("[UE4SS] Waiting for game to initialize...\n");
-    for (int i = 0; i < 10; ++i)
+    for (int i = 0; i < 30; ++i)
     {
         sleep(1);
-        UE4SS_VDBG("[UE4SS] Waiting... (%d/10)\n", i + 1);
+        UE4SS_VDBG("[UE4SS] Waiting... (%d/30)\n", i + 1);
     }
 }
 

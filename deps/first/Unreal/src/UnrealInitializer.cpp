@@ -2,6 +2,9 @@
 #include <format>
 #include <thread>
 #include <chrono>
+#ifdef __linux__
+#include <setjmp.h>
+#endif
 
 #include <Helpers/Casting.hpp>
 #include <SigScanner/SinglePassSigScanner.hpp>
@@ -739,6 +742,21 @@ namespace RC::Unreal::UnrealInitializer
             FName::ConstructorInternal.assign_temp_address(AddressOverride);
         }
 
+#ifdef __linux__
+        // On Linux with stripped binaries, the AOB-scanned FName constructor address may be
+        // wrong. Installing a hook on the wrong function corrupts it and blocks engine
+        // initialization (GUObjectArray stays at ~3 elements forever).
+        // Skip the verification hook entirely — just use the address as-is.
+        if (!FName::ConstructorInternal.is_ready())
+        {
+            fprintf(stderr, "[UE4SS] VerifyFNameConstructor: no FName address, skipping hook\n");
+            return;
+        }
+        fprintf(stderr, "[UE4SS] VerifyFNameConstructor: using address without hook (Linux)\n");
+        StaticStorage::FNameVerificationStatus.store(true, std::memory_order_release);
+        return;
+#endif
+
         // To ensure we don't use the FName constructor too early, hook it until something uses it.
         Output::send(STR("Verifying FName constructor...\n"));
         static Hook::GlobalCallbackId FNameConstructedHookId{};
@@ -836,7 +854,12 @@ namespace RC::Unreal::UnrealInitializer
             VerifyFNameConstructor();
         }
 
+        fprintf(stderr, "[UE4SS] Initialize: version=%d.%d, about to call Output::send\n", Version::Major, Version::Minor);
+#ifdef __linux__
+        fprintf(stderr, "[UE4SS] Using engine version: %d.%d\n", Version::Major, Version::Minor);
+#else
         Output::send(STR("Using engine version: {}.{}\n"), Version::Major, Version::Minor);
+#endif
 
         if (Version::IsDebug())
         {
@@ -847,24 +870,86 @@ namespace RC::Unreal::UnrealInitializer
             }
         }
 
+#ifdef __linux__
+        // On Linux, MemberOffsets lookup (std::unordered_map with wide strings) crashes.
+        // Use direct memory reads instead of UObjectArray::GetNumElements().
+        // FUObjectArray layout (UE5.1): ObjObjects at offset 0x10, NumElements at ObjObjects+0x14
+        auto linux_get_num_elements = []() -> int32_t {
+            if (!Unreal::GUObjectArray) return 0;
+            auto* base = reinterpret_cast<uint8_t*>(Unreal::GUObjectArray);
+            return *reinterpret_cast<int32_t*>(base + 0x24);
+        };
+#endif
+
         // Delay until enough elements have been constructed by the engine to the point where we know we can start constructing FNames.
+#ifdef __linux__
+        fprintf(stderr, "[UE4SS] Waiting for object construction...\n");
+#else
         Output::send(STR("Waiting for object construction...\n"));
+#endif
         {
             auto wait_start = std::chrono::steady_clock::now();
 #ifdef __linux__
-            // On Linux with stripped binaries, GUObjectArray may have very few elements
-            // because the engine hasn't fully initialized yet. Don't block — just proceed.
-            const int32_t min_elements = 0;
-            const int timeout_seconds = 5;
+            // The FName verification hook is now skipped on Linux, so the engine should
+            // initialize normally. Use a lower threshold for dedicated servers which may
+            // only have a few hundred objects at startup before clients connect.
+            const int32_t min_elements = 100;
+            const int timeout_seconds = 120;
 #else
             const int32_t min_elements = 10000;
             const int timeout_seconds = 60;
 #endif
+#ifdef __linux__
+            fprintf(stderr, "[UE4SS] GUObjectArray=%p, about to call GetNumElements()...\n", (void*)Unreal::GUObjectArray);
+            // Verify GUObjectArray address is still readable before accessing it
+            {
+                FILE* f = fopen("/proc/self/maps", "r");
+                bool addr_valid = false;
+                if (f) {
+                    char line[512];
+                    uintptr_t ga = reinterpret_cast<uintptr_t>(Unreal::GUObjectArray);
+                    while (fgets(line, sizeof(line), f)) {
+                        uintptr_t start, end;
+                        char perms[8] = {};
+                        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3) {
+                            if (ga >= start && ga + 0xB8 <= end && perms[0] == 'r') {
+                                addr_valid = true;
+                                break;
+                            }
+                        }
+                    }
+                    fclose(f);
+                }
+                if (!addr_valid) {
+                    fprintf(stderr, "[UE4SS] GUObjectArray address %p is no longer readable, skipping PostInitialize\n", (void*)Unreal::GUObjectArray);
+                    fprintf(stderr, "[UE4SS] Linux limited mode: GUObjectArray address became invalid after scan. Mod functionality will be limited.\n");
+                    StaticStorage::bIsInitialized = true;
+                    return;
+                }
+            }
+            fprintf(stderr, "[UE4SS] GUObjectArray address verified, calling GetNumElements()...\n");
+            // Try direct memory read first to bypass MemberOffsets lookup
+            {
+                int32_t direct_ne = *reinterpret_cast<int32_t*>(
+                    reinterpret_cast<uint8_t*>(Unreal::GUObjectArray) + 0x24);
+                fprintf(stderr, "[UE4SS] Direct read: NumElements=%d at offset 0x24\n", direct_ne);
+            }
+#endif
+#ifdef __linux__
+            while (linux_get_num_elements() < min_elements)
+#else
             while (UObjectArray::GetNumElements() < min_elements)
+#endif
             {
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - wait_start).count() > timeout_seconds)
                 {
+#ifdef __linux__
+                    int32_t cur_count = linux_get_num_elements();
+                    fprintf(stderr, "[UE4SS] Timeout waiting for object construction (%d elements). Continuing with limited FName support.\n", cur_count);
+#else
                     Output::send<LogLevel::Warning>(STR("Timeout waiting for object construction ({} elements). Continuing with limited FName support.\n"), UObjectArray::GetNumElements());
+                    break;
+#endif
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -873,7 +958,7 @@ namespace RC::Unreal::UnrealInitializer
                 if (elapsed % 10 == 0 && elapsed > 0)
                 {
                     fprintf(stderr, "[UE4SS] Waiting for object construction: %d elements (elapsed %lds)\n",
-                            (int)UObjectArray::GetNumElements(), (long)elapsed);
+                            linux_get_num_elements(), (long)elapsed);
                 }
 #endif
             }
@@ -881,10 +966,10 @@ namespace RC::Unreal::UnrealInitializer
 #ifdef __linux__
         // If GUObjectArray has 0 elements after waiting, the heuristic scan found
         // the wrong address. Skip PostInitialize to avoid crashing on object iteration.
-        if (UObjectArray::GetNumElements() == 0)
+        if (linux_get_num_elements() == 0)
         {
             fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has 0 elements (wrong address?), skipping PostInitialize\n");
-            Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray address appears invalid (0 elements). Mod functionality will be limited.\n"));
+            fprintf(stderr, "[UE4SS] Linux limited mode: GUObjectArray address appears invalid (0 elements). Mod functionality will be limited.\n");
             StaticStorage::bIsInitialized = true;
             return;
         }
@@ -892,14 +977,16 @@ namespace RC::Unreal::UnrealInitializer
         // We're assuming that KismetStringLibrary, KismetStringLibrary.Conv_NameToString, and the KismetStringLibrary CDO exists.
         // We will lock here forever if that's not the case.
         // Consider adding a limit to how long we can wait.
-        Output::send(STR("Locating KismetSystemLibrary...\n"));
+        // On Linux with stripped binaries, StaticFindObject iterates GUObjectArray which
+        // crashes due to MemberOffsets lookup (std::unordered_map with wide strings).
+        // Skip KismetStringLibrary lookup entirely — FName::ToString will use fallback.
+        fprintf(stderr, "[UE4SS] Skipping KismetStringLibrary lookup on Linux (MemberOffsets crash)\n");
         UClass* KismetStringLibrary{};
 #ifdef __linux__
-        // On Linux with stripped binaries, StaticFindObject may crash if GUObjectArray
-        // has very few elements (engine not fully initialized). Skip and use fallback.
-        if (UObjectArray::GetNumElements() >= 1000)
-        {
-#endif
+        // KismetStringLibrary lookup skipped — would crash on object iteration
+        (void)KismetStringLibrary;
+#else
+        Output::send(STR("Locating KismetSystemLibrary...\n"));
         {
             auto wait_start = std::chrono::steady_clock::now();
             while (!KismetStringLibrary)
@@ -916,16 +1003,13 @@ namespace RC::Unreal::UnrealInitializer
                 }
             }
         }
-#ifdef __linux__
-        }
-        else
-        {
-            fprintf(stderr, "[UE4SS] Skipping KismetStringLibrary lookup (GUObjectArray has only %d elements)\n",
-                    (int)UObjectArray::GetNumElements());
-        }
 #endif
         // For some games, it's found in GUObjectArray, and in other games, it's found in the function linked list.
+#ifdef __linux__
+        fprintf(stderr, "[UE4SS] Locating KismetSystemLibrary:Conv_NameToString...\n");
+#else
         Output::send(STR("Locating KismetSystemLibrary:Conv_NameToString...\n"));
+#endif
         {
             auto wait_start = std::chrono::steady_clock::now();
             while (!FName::Conv_NameToStringInternal && KismetStringLibrary)
@@ -965,15 +1049,15 @@ namespace RC::Unreal::UnrealInitializer
         }
 
 #ifdef __linux__
-        // On Linux with stripped binaries, if GUObjectArray has very few elements,
-        // the engine hasn't fully initialized and object iteration will crash.
-        // Skip the remaining PostInitialize (required objects, hooks) and continue
-        // with limited functionality. Lua mods can still start without hooks.
-        if (UObjectArray::GetNumElements() < 1000)
+        // On Linux with stripped binaries, MemberOffsets lookup (std::unordered_map with
+        // wide strings) crashes when iterating GUObjectArray. Skip the entire PostInitialize
+        // (required objects, hooks) and continue with limited functionality.
+        // Lua mods can still start without hooks.
         {
-            fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has only %d elements, skipping PostInitialize (hooks/required objects)\n",
-                    (int)UObjectArray::GetNumElements());
-            Output::send<LogLevel::Warning>(STR("Linux limited mode: GUObjectArray has only {} elements. Hooks and required object checks skipped. Mods will have limited functionality.\n"), UObjectArray::GetNumElements());
+            int32_t ne = linux_get_num_elements();
+            fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has %d elements, skipping PostInitialize (MemberOffsets crash on Linux)\n",
+                    ne);
+            fprintf(stderr, "[UE4SS] Linux limited mode: PostInitialize skipped. Mods will have limited functionality.\n");
             StaticStorage::bIsInitialized = true;
             return;
         }
