@@ -57,6 +57,7 @@
 #include <Mod/Mod.hpp>
 #ifdef __linux__
 #include <DiscordWebhook.hpp>
+#include <EmbeddedAssets.hpp>
 #include <link.h>
 #include <elf.h>
 #include <cstring>
@@ -262,6 +263,10 @@ namespace RC
             UE4SS_DBG( "[UE4SS] Constructor: calling setup_paths()...\n");
             setup_paths(moduleFilePath);
             UE4SS_DBG( "[UE4SS] Constructor: setup_paths() done. root=%s\n", m_root_directory.string().c_str());
+
+            // Extract embedded assets (Linux only) — UE4SS-settings.ini, Mods/, etc.
+            // This must happen before checking for settings file or mods
+            ExtractEmbeddedAssets(m_working_directory);
 
             // Auto-create UE4SS-settings.ini with default content if it doesn't exist
             UE4SS_DBG( "[UE4SS] Constructor: checking settings file at %s...\n", m_settings_path_and_file.string().c_str());

@@ -55,6 +55,22 @@ message("UE4SS Version: ${UE4SS_LIB_VERSION_MAJOR}.${UE4SS_LIB_VERSION_MINOR}.${
 file(GLOB_RECURSE UE4SS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/**.cpp")
 file(GLOB_RECURSE UE4SS_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/include/**.hpp")
 
+# ---------------------------------------------------------------------------
+# Embedded Assets (Linux only)
+# ---------------------------------------------------------------------------
+# On Linux, embed assets (UE4SS-settings.ini, Mods/, etc.) directly into libUE4SS.so
+# so users only need to deploy the single .so file
+if(NOT WIN32)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateEmbeddedAssets.cmake)
+    set(EMBEDDED_ASSETS_HEADER "${CMAKE_CURRENT_BINARY_DIR}/embedded_assets.h")
+    generate_embedded_assets(
+        "${CMAKE_CURRENT_SOURCE_DIR}/../assets"
+        "${EMBEDDED_ASSETS_HEADER}"
+    )
+    # Add generated header directory to include path
+    include_directories(${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
 # Filter out GUI sources when GUI is disabled
 if(NOT UE4SS_GUI_ENABLED)
     list(FILTER UE4SS_SOURCES EXCLUDE REGEX "/GUI/")
@@ -73,6 +89,9 @@ if(NOT WIN32)
     # Filter out Windows-only GUI backends
     list(FILTER UE4SS_SOURCES EXCLUDE REGEX "/GUI/DX11\\.cpp$")
     list(FILTER UE4SS_SOURCES EXCLUDE REGEX "/GUI/Windows\\.cpp$")
+else()
+    # Filter out Linux-only embedded assets on Windows
+    list(FILTER UE4SS_SOURCES EXCLUDE REGEX "EmbeddedAssets\\.cpp$")
 endif()
 
 # Create the main library
@@ -207,28 +226,25 @@ set_target_properties(UE4SS PROPERTIES
 organize_targets("^UE4SS$" "RE-UE4SS")
 
 # ---------------------------------------------------------------------------
-# Copy Assets to Output Directory
+# Copy Assets to Output Directory (Windows only)
 # ---------------------------------------------------------------------------
-# Copy essential assets (settings, mods, signatures) alongside the built library
-set(UE4SS_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../assets")
-
-# Post-build: copy assets to output directory
-add_custom_command(TARGET UE4SS POST_BUILD
-    # Copy UE4SS-settings.ini
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${UE4SS_ASSETS_DIR}/UE4SS-settings.ini"
-        "$<TARGET_FILE_DIR:UE4SS>/UE4SS-settings.ini"
-    # Copy Mods directory (standard mods like BPModLoaderMod, ConsoleCommandsMod, etc.)
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${UE4SS_ASSETS_DIR}/Mods"
-        "$<TARGET_FILE_DIR:UE4SS>/Mods"
-    # Copy UE4SS_Signatures directory (for custom signature overrides)
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${UE4SS_ASSETS_DIR}/UE4SS_Signatures"
-        "$<TARGET_FILE_DIR:UE4SS>/UE4SS_Signatures"
-    # Copy LICENSE
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE"
-        "$<TARGET_FILE_DIR:UE4SS>/LICENSE"
-    COMMENT "Copying UE4SS assets to output directory"
-)
+# On Linux, assets are embedded in libUE4SS.so and extracted at runtime.
+# On Windows, copy assets alongside the DLL.
+if(WIN32)
+    set(UE4SS_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../assets")
+    add_custom_command(TARGET UE4SS POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${UE4SS_ASSETS_DIR}/UE4SS-settings.ini"
+            "$<TARGET_FILE_DIR:UE4SS>/UE4SS-settings.ini"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${UE4SS_ASSETS_DIR}/Mods"
+            "$<TARGET_FILE_DIR:UE4SS>/Mods"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${UE4SS_ASSETS_DIR}/UE4SS_Signatures"
+            "$<TARGET_FILE_DIR:UE4SS>/UE4SS_Signatures"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE"
+            "$<TARGET_FILE_DIR:UE4SS>/LICENSE"
+        COMMENT "Copying UE4SS assets to output directory"
+    )
+endif()
