@@ -683,16 +683,36 @@ namespace RC
 
 #ifdef __linux__
             // C++ mods are now started inside setup_unreal() (both full and limited mode paths).
-            // Previously, start_cpp_mods() was called here but setup_unreal() started the event loop
-            // and blocked forever, so this code was never reached.
             //
-            // On Linux, always use limited mode for post-init: MemberOffsets lookup crashes
-            // even when GUObjectArray was found (stripped binary, no FName::ToString for offset names).
-            // fire_unreal_init_for_cpp_mods() and setup_unreal_properties() would crash.
-            // Start the event loop directly so the server keeps running and C++ mods stay active.
+            // If MemberVariableLayout.ini was loaded, we have all the member offsets needed
+            // for full UE post-init. This enables fire_unreal_init_for_cpp_mods() (so C++ mods
+            // get on_unreal_init() and can use UE API) and setup_unreal_properties() (for Lua).
+            // Also requires FName::ConstructorInternal to be resolved (for FName() calls in setup_unreal_properties).
+            if (m_custom_member_variable_layout_loaded && Unreal::FName::ConstructorInternal.is_ready())
             {
-                UE4SS_DBG( "[UE4SS] Linux: starting event loop (limited mode, no UE post-init).\n");
+                UE4SS_DBG("[UE4SS] Linux: full mode — MemberVariableLayout.ini loaded, calling fire_unreal_init_for_cpp_mods() and setup_unreal_properties().\n");
+                fprintf(stderr, "[UE4SS] Linux: full mode enabled (MemberVariableLayout.ini + FName constructor resolved).\n");
+                Output::send(STR("Unreal Engine modules ({}):\n"), SigScannerStaticData::m_is_modular ? STR("modular") : STR("non-modular"));
+
+                TRY([&] { fire_unreal_init_for_cpp_mods(); });
+                TRY([&] { setup_unreal_properties(); });
+
+                UE4SS_DBG("[UE4SS] Linux: full mode post-init done, starting event loop.\n");
+                fprintf(stderr, "[UE4SS] Linux: full mode post-init done, starting event loop.\n");
+                m_event_loop = std::jthread{&UE4SSProgram::update, this};
+                m_event_loop.join();
+                return;
+            }
+            else
+            {
+                UE4SS_DBG("[UE4SS] Linux: limited mode — MemberVariableLayout.ini %s, FName constructor %s.\n",
+                          m_custom_member_variable_layout_loaded ? "loaded" : "NOT loaded",
+                          Unreal::FName::ConstructorInternal.is_ready() ? "resolved" : "NOT resolved");
                 fprintf(stderr, "[UE4SS] Linux: starting event loop (limited mode, no UE post-init).\n");
+                if (!m_custom_member_variable_layout_loaded)
+                {
+                    fprintf(stderr, "[UE4SS] Linux: MemberVariableLayout.ini not found. Place it next to libUE4SS.so for full UE API support.\n");
+                }
                 m_event_loop = std::jthread{&UE4SSProgram::update, this};
                 m_event_loop.join();
                 return;
@@ -898,6 +918,364 @@ namespace RC
         }
     }
 
+    auto UE4SSProgram::load_default_member_offsets() -> void
+    {
+        // Hardcoded offsets for Palworld (UE5.1) — used when MemberVariableLayout.ini is not present.
+        // Based on the official UE5.1 template from RE-UE4SS with Palworld-specific UEnum::Names fix (0x48).
+        using namespace Unreal;
+
+        // UObjectBase
+        UObjectBase::MemberOffsets.emplace(STR("ObjectFlags"), 0x8);
+        UObjectBase::MemberOffsets.emplace(STR("InternalIndex_Private"), 0xC);
+        UObjectBase::MemberOffsets.emplace(STR("ClassPrivate"), 0x10);
+        UObjectBase::MemberOffsets.emplace(STR("NamePrivate"), 0x18);
+        UObjectBase::MemberOffsets.emplace(STR("OuterPrivate"), 0x20);
+        UObjectBase::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x28);
+
+        // UScriptStruct::ICppStructOps
+        UScriptStruct::ICppStructOps::MemberOffsets.emplace(STR("Size"), 0x8);
+        UScriptStruct::ICppStructOps::MemberOffsets.emplace(STR("Alignment"), 0xC);
+        UScriptStruct::ICppStructOps::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x10);
+
+        // FOutputDevice
+        FOutputDevice::MemberOffsets.emplace(STR("bSuppressEventTag"), 0x8);
+        FOutputDevice::MemberOffsets.emplace(STR("bAutoEmitLineTerminator"), 0x9);
+        FOutputDevice::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x10);
+
+        // UStruct
+        UStruct::MemberOffsets.emplace(STR("SuperStruct"), 0x40);
+        UStruct::MemberOffsets.emplace(STR("Children"), 0x48);
+        UStruct::MemberOffsets.emplace(STR("ChildProperties"), 0x50);
+        UStruct::MemberOffsets.emplace(STR("PropertiesSize"), 0x58);
+        UStruct::MemberOffsets.emplace(STR("MinAlignment"), 0x5C);
+        UStruct::MemberOffsets.emplace(STR("Script"), 0x60);
+        UStruct::MemberOffsets.emplace(STR("PropertyLink"), 0x70);
+        UStruct::MemberOffsets.emplace(STR("RefLink"), 0x78);
+        UStruct::MemberOffsets.emplace(STR("DestructorLink"), 0x80);
+        UStruct::MemberOffsets.emplace(STR("PostConstructLink"), 0x88);
+        UStruct::MemberOffsets.emplace(STR("ScriptAndPropertyObjectReferences"), 0x90);
+        UStruct::MemberOffsets.emplace(STR("UnresolvedScriptProperties"), 0xA0);
+        UStruct::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xB0);
+
+        // FUObjectItem
+        FUObjectItem::MemberOffsets.emplace(STR("Object"), 0x0);
+        FUObjectItem::MemberOffsets.emplace(STR("Flags"), 0x8);
+        FUObjectItem::MemberOffsets.emplace(STR("ClusterRootIndex"), 0xC);
+        FUObjectItem::MemberOffsets.emplace(STR("SerialNumber"), 0x10);
+        FUObjectItem::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x18);
+
+        // FUObjectArray
+        FUObjectArray::MemberOffsets.emplace(STR("ObjFirstGCIndex"), 0x0);
+        FUObjectArray::MemberOffsets.emplace(STR("ObjLastNonGCIndex"), 0x4);
+        FUObjectArray::MemberOffsets.emplace(STR("MaxObjectsNotConsideredByGC"), 0x8);
+        FUObjectArray::MemberOffsets.emplace(STR("OpenForDisregardForGC"), 0xC);
+        FUObjectArray::MemberOffsets.emplace(STR("ObjObjects"), 0x10);
+        FUObjectArray::MemberOffsets.emplace(STR("ObjAvailableList"), 0x58);
+        FUObjectArray::MemberOffsets.emplace(STR("UObjectCreateListeners"), 0x68);
+        FUObjectArray::MemberOffsets.emplace(STR("UObjectDeleteListeners"), 0x78);
+        FUObjectArray::MemberOffsets.emplace(STR("PrimarySerialNumber"), 0xB0);
+        FUObjectArray::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xB8);
+
+        // TUObjectArray
+        TUObjectArray::MemberOffsets.emplace(STR("Objects"), 0x0);
+        TUObjectArray::MemberOffsets.emplace(STR("PreAllocatedObjects"), 0x8);
+        TUObjectArray::MemberOffsets.emplace(STR("MaxElements"), 0x10);
+        TUObjectArray::MemberOffsets.emplace(STR("NumElements"), 0x14);
+        TUObjectArray::MemberOffsets.emplace(STR("MaxChunks"), 0x18);
+        TUObjectArray::MemberOffsets.emplace(STR("NumChunks"), 0x1C);
+        TUObjectArray::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x20);
+
+        // UField
+        UField::MemberOffsets.emplace(STR("Next"), 0x28);
+        UField::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x30);
+
+        // FFieldClass
+        FFieldClass::MemberOffsets.emplace(STR("Name"), 0x0);
+        FFieldClass::MemberOffsets.emplace(STR("Id"), 0x8);
+        FFieldClass::MemberOffsets.emplace(STR("CastFlags"), 0x10);
+        FFieldClass::MemberOffsets.emplace(STR("ClassFlags"), 0x18);
+        FFieldClass::MemberOffsets.emplace(STR("SuperClass"), 0x20);
+        FFieldClass::MemberOffsets.emplace(STR("DefaultObject"), 0x28);
+        FFieldClass::MemberOffsets.emplace(STR("ConstructFn"), 0x30);
+        FFieldClass::MemberOffsets.emplace(STR("UnqiueNameIndexCounter"), 0x38);
+        FFieldClass::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x40);
+
+        // FField
+        FField::MemberOffsets.emplace(STR("ClassPrivate"), 0x8);
+        FField::MemberOffsets.emplace(STR("Owner"), 0x10);
+        FField::MemberOffsets.emplace(STR("Next"), 0x20);
+        FField::MemberOffsets.emplace(STR("NamePrivate"), 0x28);
+        FField::MemberOffsets.emplace(STR("FlagsPrivate"), 0x30);
+        FField::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x38);
+
+        // FProperty
+        FProperty::MemberOffsets.emplace(STR("ArrayDim"), 0x38);
+        FProperty::MemberOffsets.emplace(STR("ElementSize"), 0x3C);
+        FProperty::MemberOffsets.emplace(STR("PropertyFlags"), 0x40);
+        FProperty::MemberOffsets.emplace(STR("RepIndex"), 0x48);
+        FProperty::MemberOffsets.emplace(STR("Offset_Internal"), 0x4C);
+        FProperty::MemberOffsets.emplace(STR("RepNotifyFunc"), 0x50);
+        FProperty::MemberOffsets.emplace(STR("PropertyLinkNext"), 0x58);
+        FProperty::MemberOffsets.emplace(STR("NextRef"), 0x60);
+        FProperty::MemberOffsets.emplace(STR("DestructorLinkNext"), 0x68);
+        FProperty::MemberOffsets.emplace(STR("PostConstructLinkNext"), 0x70);
+        FProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x78);
+
+        // FMulticastDelegateProperty
+        FMulticastDelegateProperty::MemberOffsets.emplace(STR("SignatureFunction"), 0x78);
+        FMulticastDelegateProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FObjectPropertyBase
+        FObjectPropertyBase::MemberOffsets.emplace(STR("PropertyClass"), 0x78);
+        FObjectPropertyBase::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FStructProperty
+        FStructProperty::MemberOffsets.emplace(STR("Struct"), 0x78);
+        FStructProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FArrayProperty
+        FArrayProperty::MemberOffsets.emplace(STR("Inner"), 0x78);
+        FArrayProperty::MemberOffsets.emplace(STR("ArrayFlags"), 0x80);
+        FArrayProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x88);
+
+        // FMapProperty
+        FMapProperty::MemberOffsets.emplace(STR("KeyProp"), 0x78);
+        FMapProperty::MemberOffsets.emplace(STR("ValueProp"), 0x80);
+        FMapProperty::MemberOffsets.emplace(STR("MapLayout"), 0x88);
+        FMapProperty::MemberOffsets.emplace(STR("MapFlags"), 0xA0);
+        FMapProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xA8);
+
+        // FBoolProperty
+        FBoolProperty::MemberOffsets.emplace(STR("FieldSize"), 0x78);
+        FBoolProperty::MemberOffsets.emplace(STR("ByteOffset"), 0x79);
+        FBoolProperty::MemberOffsets.emplace(STR("ByteMask"), 0x7A);
+        FBoolProperty::MemberOffsets.emplace(STR("FieldMask"), 0x7B);
+        FBoolProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FByteProperty
+        FByteProperty::MemberOffsets.emplace(STR("Enum"), 0x78);
+        FByteProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FEnumProperty
+        FEnumProperty::MemberOffsets.emplace(STR("UnderlyingProp"), 0x78);
+        FEnumProperty::MemberOffsets.emplace(STR("Enum"), 0x80);
+        FEnumProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x88);
+
+        // FClassProperty
+        FClassProperty::MemberOffsets.emplace(STR("MetaClass"), 0x80);
+        FClassProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x88);
+
+        // FSoftClassProperty
+        FSoftClassProperty::MemberOffsets.emplace(STR("MetaClass"), 0x80);
+        FSoftClassProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x88);
+
+        // FDelegateProperty
+        FDelegateProperty::MemberOffsets.emplace(STR("SignatureFunction"), 0x78);
+        FDelegateProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FInterfaceProperty
+        FInterfaceProperty::MemberOffsets.emplace(STR("InterfaceClass"), 0x78);
+        FInterfaceProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FFieldPathProperty
+        FFieldPathProperty::MemberOffsets.emplace(STR("PropertyClass"), 0x78);
+        FFieldPathProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x80);
+
+        // FSetProperty
+        FSetProperty::MemberOffsets.emplace(STR("ElementProp"), 0x78);
+        FSetProperty::MemberOffsets.emplace(STR("SetLayout"), 0x80);
+        FSetProperty::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x98);
+
+        // UScriptStruct
+        UScriptStruct::MemberOffsets.emplace(STR("StructFlags"), 0xB0);
+        UScriptStruct::MemberOffsets.emplace(STR("bPrepareCppStructOpsCompleted"), 0xB4);
+        UScriptStruct::MemberOffsets.emplace(STR("CppStructOps"), 0xB8);
+        UScriptStruct::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xC0);
+
+        // UFunction
+        UFunction::MemberOffsets.emplace(STR("FunctionFlags"), 0xB0);
+        UFunction::MemberOffsets.emplace(STR("NumParms"), 0xB4);
+        UFunction::MemberOffsets.emplace(STR("ParmsSize"), 0xB6);
+        UFunction::MemberOffsets.emplace(STR("ReturnValueOffset"), 0xB8);
+        UFunction::MemberOffsets.emplace(STR("RPCId"), 0xBA);
+        UFunction::MemberOffsets.emplace(STR("RPCResponseId"), 0xBC);
+        UFunction::MemberOffsets.emplace(STR("FirstPropertyToInit"), 0xC0);
+        UFunction::MemberOffsets.emplace(STR("EventGraphFunction"), 0xC8);
+        UFunction::MemberOffsets.emplace(STR("EventGraphCallOffset"), 0xD0);
+        UFunction::MemberOffsets.emplace(STR("Func"), 0xD8);
+        UFunction::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xE0);
+
+        // UClass
+        UClass::MemberOffsets.emplace(STR("ClassConstructor"), 0xB0);
+        UClass::MemberOffsets.emplace(STR("ClassVTableHelperCtorCaller"), 0xB8);
+        UClass::MemberOffsets.emplace(STR("ClassUnique"), 0xC8);
+        UClass::MemberOffsets.emplace(STR("FirstOwnedClassRep"), 0xCC);
+        UClass::MemberOffsets.emplace(STR("bCooked"), 0xD0);
+        UClass::MemberOffsets.emplace(STR("bLayoutChanging"), 0xD1);
+        UClass::MemberOffsets.emplace(STR("ClassFlags"), 0xD4);
+        UClass::MemberOffsets.emplace(STR("ClassCastFlags"), 0xD8);
+        UClass::MemberOffsets.emplace(STR("ClassWithin"), 0xE0);
+        UClass::MemberOffsets.emplace(STR("ClassConfigName"), 0xE8);
+        UClass::MemberOffsets.emplace(STR("NetFields"), 0x100);
+        UClass::MemberOffsets.emplace(STR("ClassDefaultObject"), 0x110);
+        UClass::MemberOffsets.emplace(STR("SparseClassData"), 0x118);
+        UClass::MemberOffsets.emplace(STR("SparseClassDataStruct"), 0x120);
+        UClass::MemberOffsets.emplace(STR("FuncMap"), 0x128);
+        UClass::MemberOffsets.emplace(STR("SuperFuncMap"), 0x178);
+        UClass::MemberOffsets.emplace(STR("Interfaces"), 0x1D0);
+        UClass::MemberOffsets.emplace(STR("ReferenceTokenStream"), 0x1E0);
+        UClass::MemberOffsets.emplace(STR("NativeFunctionLookupTable"), 0x220);
+        UClass::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x230);
+
+        // UEnum — Palworld-specific: Names = 0x48 (not 0x40), EnumFlags_Internal = 0x5C
+        UEnum::MemberOffsets.emplace(STR("CppType"), 0x30);
+        UEnum::MemberOffsets.emplace(STR("Names"), 0x48);
+        UEnum::MemberOffsets.emplace(STR("CppForm"), 0x50);
+        UEnum::MemberOffsets.emplace(STR("EnumFlags_Internal"), 0x5C);
+        UEnum::MemberOffsets.emplace(STR("EnumDisplayNameFn"), 0x60);
+        UEnum::MemberOffsets.emplace(STR("EnumPackage"), 0x68);
+        UEnum::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x68);
+
+        // UWorld
+        UWorld::MemberOffsets.emplace(STR("ExtraReferencedObjects"), 0x68);
+        UWorld::MemberOffsets.emplace(STR("PerModuleDataObjects"), 0x78);
+        UWorld::MemberOffsets.emplace(STR("StreamingLevelsPrefix"), 0xC8);
+        UWorld::MemberOffsets.emplace(STR("bSupportsMakingVisibleTransactionRequests"), 0xD8);
+        UWorld::MemberOffsets.emplace(STR("bSupportsMakingInvisibleTransactionRequests"), 0xDA);
+        UWorld::MemberOffsets.emplace(STR("bAllowDeferredPhysicsStateCreation"), 0x108);
+        UWorld::MemberOffsets.emplace(STR("LastRenderTime"), 0x130);
+        UWorld::MemberOffsets.emplace(STR("IsInBlockTillLevelStreamingCompleted"), 0x140);
+        UWorld::MemberOffsets.emplace(STR("BlockTillLevelStreamingCompletedEpoch"), 0x144);
+        UWorld::MemberOffsets.emplace(STR("AuthorityGameMode"), 0x150);
+        UWorld::MemberOffsets.emplace(STR("ActiveLevelCollectionIndex"), 0x190);
+        UWorld::MemberOffsets.emplace(STR("LWILastAssignedUID"), 0x258);
+        UWorld::MemberOffsets.emplace(STR("BuildStreamingDataTimer"), 0x448);
+        UWorld::MemberOffsets.emplace(STR("URL"), 0x540);
+        UWorld::MemberOffsets.emplace(STR("PlayerNum"), 0x618);
+        UWorld::MemberOffsets.emplace(STR("StreamingVolumeUpdateDelay"), 0x61C);
+        UWorld::MemberOffsets.emplace(STR("LastTimeUnbuiltLightingWasEncountered"), 0x658);
+        UWorld::MemberOffsets.emplace(STR("TimeSeconds"), 0x660);
+        UWorld::MemberOffsets.emplace(STR("UnpausedTimeSeconds"), 0x668);
+        UWorld::MemberOffsets.emplace(STR("RealTimeSeconds"), 0x670);
+        UWorld::MemberOffsets.emplace(STR("AudioTimeSeconds"), 0x678);
+        UWorld::MemberOffsets.emplace(STR("DeltaRealTimeSeconds"), 0x680);
+        UWorld::MemberOffsets.emplace(STR("DeltaTimeSeconds"), 0x684);
+        UWorld::MemberOffsets.emplace(STR("PauseDelay"), 0x688);
+        UWorld::MemberOffsets.emplace(STR("NextSwitchCountdown"), 0x6C0);
+        UWorld::MemberOffsets.emplace(STR("NumStreamingLevelsBeingLoaded"), 0x6DA);
+        UWorld::MemberOffsets.emplace(STR("NextURL"), 0x6E0);
+        UWorld::MemberOffsets.emplace(STR("PreparingLevelNames"), 0x6F0);
+        UWorld::MemberOffsets.emplace(STR("CommittedPersistentLevelName"), 0x700);
+        UWorld::MemberOffsets.emplace(STR("CleanupWorldTag"), 0x70C);
+        UWorld::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x898);
+
+        // AActor
+        AActor::MemberOffsets.emplace(STR("PrimaryActorTick"), 0x28);
+        AActor::MemberOffsets.emplace(STR("InitialLifeSpan"), 0x60);
+        AActor::MemberOffsets.emplace(STR("CustomTimeDilation"), 0x64);
+        AActor::MemberOffsets.emplace(STR("RemoteRole"), 0x68);
+        AActor::MemberOffsets.emplace(STR("RayTracingGroupId"), 0x6C);
+        AActor::MemberOffsets.emplace(STR("AttachmentReplication"), 0x70);
+        AActor::MemberOffsets.emplace(STR("ReplicatedMovement"), 0xD0);
+        AActor::MemberOffsets.emplace(STR("Owner"), 0x140);
+        AActor::MemberOffsets.emplace(STR("NetDriverName"), 0x148);
+        AActor::MemberOffsets.emplace(STR("Role"), 0x150);
+        AActor::MemberOffsets.emplace(STR("NetDormancy"), 0x151);
+        AActor::MemberOffsets.emplace(STR("SpawnCollisionHandlingMethod"), 0x152);
+        AActor::MemberOffsets.emplace(STR("AutoReceiveInput"), 0x153);
+        AActor::MemberOffsets.emplace(STR("InputPriority"), 0x154);
+        AActor::MemberOffsets.emplace(STR("CreationTime"), 0x158);
+        AActor::MemberOffsets.emplace(STR("InputComponent"), 0x160);
+        AActor::MemberOffsets.emplace(STR("NetCullDistanceSquared"), 0x168);
+        AActor::MemberOffsets.emplace(STR("NetTag"), 0x16C);
+        AActor::MemberOffsets.emplace(STR("NetUpdateFrequency"), 0x170);
+        AActor::MemberOffsets.emplace(STR("MinNetUpdateFrequency"), 0x174);
+        AActor::MemberOffsets.emplace(STR("NetPriority"), 0x178);
+        AActor::MemberOffsets.emplace(STR("LastRenderTime"), 0x17C);
+        AActor::MemberOffsets.emplace(STR("Children"), 0x188);
+        AActor::MemberOffsets.emplace(STR("RootComponent"), 0x198);
+        AActor::MemberOffsets.emplace(STR("TimerHandle_LifeSpanExpired"), 0x1A0);
+        AActor::MemberOffsets.emplace(STR("Layers"), 0x1A8);
+        AActor::MemberOffsets.emplace(STR("ParentComponent"), 0x1B8);
+        AActor::MemberOffsets.emplace(STR("Tags"), 0x1C0);
+        AActor::MemberOffsets.emplace(STR("ReplicatedSubObjects"), 0x1E0);
+        AActor::MemberOffsets.emplace(STR("ReplicatedComponentsInfo"), 0x1F0);
+        AActor::MemberOffsets.emplace(STR("DetachFence"), 0x280);
+        AActor::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x290);
+
+        // AGameModeBase
+        AGameModeBase::MemberOffsets.emplace(STR("OptionsString"), 0x290);
+        AGameModeBase::MemberOffsets.emplace(STR("GameSessionClass"), 0x2A0);
+        AGameModeBase::MemberOffsets.emplace(STR("PlayerStateClass"), 0x2B8);
+        AGameModeBase::MemberOffsets.emplace(STR("HUDClass"), 0x2C0);
+        AGameModeBase::MemberOffsets.emplace(STR("SpectatorClass"), 0x2D0);
+        AGameModeBase::MemberOffsets.emplace(STR("ServerStatReplicatorClass"), 0x2E0);
+        AGameModeBase::MemberOffsets.emplace(STR("GameSession"), 0x2E8);
+        AGameModeBase::MemberOffsets.emplace(STR("ServerStatReplicator"), 0x2F8);
+        AGameModeBase::MemberOffsets.emplace(STR("DefaultPlayerName"), 0x300);
+        AGameModeBase::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x330);
+
+        // AGameMode
+        AGameMode::MemberOffsets.emplace(STR("MatchState"), 0x330);
+        AGameMode::MemberOffsets.emplace(STR("NumSpectators"), 0x33C);
+        AGameMode::MemberOffsets.emplace(STR("NumPlayers"), 0x340);
+        AGameMode::MemberOffsets.emplace(STR("NumBots"), 0x344);
+        AGameMode::MemberOffsets.emplace(STR("MinRespawnDelay"), 0x348);
+        AGameMode::MemberOffsets.emplace(STR("NumTravellingPlayers"), 0x34C);
+        AGameMode::MemberOffsets.emplace(STR("EngineMessageClass"), 0x350);
+        AGameMode::MemberOffsets.emplace(STR("InactivePlayerArray"), 0x358);
+        AGameMode::MemberOffsets.emplace(STR("InactivePlayerStateLifeSpan"), 0x368);
+        AGameMode::MemberOffsets.emplace(STR("MaxInactivePlayers"), 0x36C);
+        AGameMode::MemberOffsets.emplace(STR("bHandleDedicatedServerReplays"), 0x370);
+        AGameMode::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x378);
+
+        // UPlayer
+        UPlayer::MemberOffsets.emplace(STR("CurrentNetSpeed"), 0x38);
+        UPlayer::MemberOffsets.emplace(STR("ConfiguredInternetSpeed"), 0x3C);
+        UPlayer::MemberOffsets.emplace(STR("ConfiguredLanSpeed"), 0x40);
+        UPlayer::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x48);
+
+        // ULocalPlayer
+        ULocalPlayer::MemberOffsets.emplace(STR("CachedUniqueNetId"), 0x48);
+        ULocalPlayer::MemberOffsets.emplace(STR("ViewportClient"), 0x78);
+        ULocalPlayer::MemberOffsets.emplace(STR("AspectRatioAxisConstraint"), 0xB8);
+        ULocalPlayer::MemberOffsets.emplace(STR("ControllerId"), 0xE0);
+        ULocalPlayer::MemberOffsets.emplace(STR("PlatformUserId"), 0x100);
+        ULocalPlayer::MemberOffsets.emplace(STR("SlateOperations"), 0x1E0);
+        ULocalPlayer::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x298);
+
+        // FWorldContext
+        FWorldContext::MemberOffsets.emplace(STR("ContextHandle"), 0xA0);
+        FWorldContext::MemberOffsets.emplace(STR("TravelURL"), 0xA8);
+        FWorldContext::MemberOffsets.emplace(STR("TravelType"), 0xB8);
+        FWorldContext::MemberOffsets.emplace(STR("LastURL"), 0xC0);
+        FWorldContext::MemberOffsets.emplace(STR("LastRemoteURL"), 0x128);
+        FWorldContext::MemberOffsets.emplace(STR("LevelsToLoadForPendingMapChange"), 0x1A8);
+        FWorldContext::MemberOffsets.emplace(STR("PendingMapChangeFailureDescription"), 0x1C8);
+        FWorldContext::MemberOffsets.emplace(STR("GameViewport"), 0x200);
+        FWorldContext::MemberOffsets.emplace(STR("PIEInstance"), 0x220);
+        FWorldContext::MemberOffsets.emplace(STR("PIEPrefix"), 0x228);
+        FWorldContext::MemberOffsets.emplace(STR("RunAsDedicated"), 0x23C);
+        FWorldContext::MemberOffsets.emplace(STR("bWaitingOnOnlineSubsystem"), 0x23D);
+        FWorldContext::MemberOffsets.emplace(STR("bIsPrimaryPIEInstance"), 0x23E);
+        FWorldContext::MemberOffsets.emplace(STR("AudioDeviceID"), 0x240);
+        FWorldContext::MemberOffsets.emplace(STR("CustomDescription"), 0x248);
+        FWorldContext::MemberOffsets.emplace(STR("PIEFixedTickSeconds"), 0x258);
+        FWorldContext::MemberOffsets.emplace(STR("PIEAccumulatedTickSeconds"), 0x25C);
+        FWorldContext::MemberOffsets.emplace(STR("GarbageObjectsToVerify"), 0x260);
+        FWorldContext::MemberOffsets.emplace(STR("ExternalReferences"), 0x2B0);
+        FWorldContext::MemberOffsets.emplace(STR("ThisCurrentWorld"), 0x2C0);
+        FWorldContext::MemberOffsets.emplace(STR("UEP_TotalSize"), 0x2C8);
+
+        // UDataTable
+        UDataTable::MemberOffsets.emplace(STR("RowStruct"), 0x28);
+        UDataTable::MemberOffsets.emplace(STR("RowMap"), 0x30);
+        UDataTable::MemberOffsets.emplace(STR("ImportKeyField"), 0x88);
+        UDataTable::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xB0);
+
+        m_custom_member_variable_layout_loaded = true;
+    }
+
     auto UE4SSProgram::setup_unreal() -> void
     {
         ProfilerScope();
@@ -910,6 +1288,18 @@ namespace RC
         {
             Output::send(STR("MemberVariableLayout.ini loaded\n"));
             output_all_member_offsets(IsCoalesced::No);
+        }
+        else
+        {
+#ifdef __linux__
+            UE4SS_DBG("[UE4SS] Linux: MemberVariableLayout.ini not found, loading hardcoded Palworld UE5.1 offsets.\n");
+            fprintf(stderr, "[UE4SS] Linux: MemberVariableLayout.ini not found, using built-in Palworld UE5.1 offsets.\n");
+            load_default_member_offsets();
+            Output::send(STR("Built-in Palworld UE5.1 member offsets loaded\n"));
+            output_all_member_offsets(IsCoalesced::No);
+#else
+            Output::send<LogLevel::Warning>(STR("MemberVariableLayout.ini not found. Some features may not work correctly.\n"));
+#endif
         }
 
         Unreal::UnrealInitializer::Config config;
@@ -2869,13 +3259,14 @@ namespace RC
 
             // LuaMod::on_program_start() and fire_program_start_for_cpp_mods() require resolved
             // UE function addresses (GUObjectArray, ProcessInternal, etc.) for hook registration
-            // and the UObjectArray delete listener. Only call them if address resolution succeeded
-            // (via dlsym on unstripped binaries or manual UE4SS_Addresses.ini overrides).
-            // On Linux with stripped binaries, MemberOffsets lookup crashes, so always use limited mode.
-            if (Unreal::GUObjectArray && linux_get_num_elements() >= 0x7FFFFFFF)
+            // and the UObjectArray delete listener.
+            // Full mode requires: MemberVariableLayout.ini loaded (for MemberOffsets) + GUObjectArray found.
+            if (Unreal::GUObjectArray && m_custom_member_variable_layout_loaded && linux_get_num_elements() > 0)
             {
-                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray resolved with %d elements, calling start_cpp_mods(), LuaMod::on_program_start() and fire_program_start_for_cpp_mods()...\n",
+                UE4SS_DBG( "[UE4SS] Linux: full mode — GUObjectArray resolved with %d elements, calling start_cpp_mods(), LuaMod::on_program_start() and fire_program_start_for_cpp_mods()...\n",
                           linux_get_num_elements());
+                fprintf(stderr, "[UE4SS] Linux: full mode — GUObjectArray has %d elements. Starting mods with UE API support.\n",
+                    linux_get_num_elements());
                 TRY([&] { start_cpp_mods(IsInitialStartup::Yes); });
                 TRY([&] { LuaMod::on_program_start(); });
                 TRY([&] { fire_program_start_for_cpp_mods(); });
@@ -2886,10 +3277,13 @@ namespace RC
             }
             else
             {
-                UE4SS_DBG( "[UE4SS] Linux: GUObjectArray has only %d elements, starting Lua mods without hooks\n",
+                UE4SS_DBG( "[UE4SS] Linux: limited mode — GUObjectArray %s, MemberVariableLayout %s, elements %d\n",
+                          Unreal::GUObjectArray ? "found" : "NOT found",
+                          m_custom_member_variable_layout_loaded ? "loaded" : "NOT loaded",
                           Unreal::GUObjectArray ? linux_get_num_elements() : -1);
-                fprintf(stderr, "[UE4SS] Linux limited mode: GUObjectArray has only %d elements. Starting mods without UE hooks. Some mod features may not work.\n",
-                    Unreal::GUObjectArray ? linux_get_num_elements() : 0);
+                fprintf(stderr, "[UE4SS] Linux limited mode: GUObjectArray %s, MemberVariableLayout.ini %s. Starting mods without UE hooks.\n",
+                    Unreal::GUObjectArray ? "found" : "NOT found",
+                    m_custom_member_variable_layout_loaded ? "loaded" : "NOT loaded");
                 // Start C++ mods FIRST — start_mod() must be called before fire_program_start_for_cpp_mods()
                 // otherwise on_program_start() is called on a null m_mod pointer.
                 UE4SS_DBG( "[UE4SS] Linux: calling start_cpp_mods() (limited mode)...\n");
@@ -3296,19 +3690,104 @@ namespace RC
 #else
                     staged_file.replace_extension(".dll");
 #endif
-                    if (!std::filesystem::exists(staged_file))
+#ifdef __linux__
+                    auto main_file = watched_dir / "main.so";
+#else
+                    auto main_file = watched_dir / "main.dll";
+#endif
+
+                    bool has_staged = std::filesystem::exists(staged_file);
+                    bool has_main = std::filesystem::exists(main_file);
+                    if (!has_staged && !has_main)
                     {
                         return;
                     }
-                    // TODO: Unload the library (uninstall).
-                    //       Delete 'main.so'/'main.dll'.
-                    //       Rename 'staged_file' to 'main.so'/'main.dll'.
-                    //       Load 'main.so'/'main.dll' (install & start).
 
-                    // TODO: To reload C++ mods, we need to add a way to unregister hooks, and then C++ mods need to unregister on they get notified that they're getting unloaded.
-                    //       For Lua mods, there's no notification, but we track all the hooks internally, so we can unregister automatically, we just need to
-                    //       call Lua::Uninstall, and We must also remove the keybinds like we do in UE4SSProgram::reinstall_mods.
-                    //       Unsure about loading and starting mods again.
+                    // Find the existing C++ mod (installed, any start state)
+                    auto mod_name_str = ensure_str(mod_name);
+                    auto* existing_mod = find_mod_by_name<CppMod>(mod_name_str, IsInstalled::Yes);
+                    if (!existing_mod)
+                    {
+                        return;
+                    }
+
+                    Output::send(STR("Auto-reloading C++ mod '{}'\n"), existing_mod->get_name());
+                    m_pause_events_processing = true;
+
+                    // Save mod info before destroying
+                    StringType saved_mod_name = StringType{existing_mod->get_name()};
+                    auto saved_mod_path = existing_mod->get_path();
+
+                    // Uninstall the old mod if started (calls uninstall_mod which deletes the CppUserModBase)
+                    if (existing_mod->is_started())
+                    {
+                        existing_mod->uninstall();
+                    }
+
+                    // Find the old CppMod in m_mods and destroy it (calls ~CppMod() which calls dlclose)
+                    auto mod_it = std::ranges::find_if(m_mods, [&](const std::unique_ptr<Mod>& mod_ptr) {
+                        return mod_ptr.get() == existing_mod;
+                    });
+                    if (mod_it == m_mods.end())
+                    {
+                        m_pause_events_processing = false;
+                        return;
+                    }
+
+                    // Destroy old CppMod — this calls dlclose, unloading the old .so
+                    mod_it->reset();
+
+                    // If a staged file exists, replace main.so with it
+                    if (has_staged)
+                    {
+                        std::error_code ec;
+                        if (std::filesystem::exists(main_file))
+                            std::filesystem::remove(main_file, ec);
+                        std::filesystem::rename(staged_file, main_file, ec);
+                    }
+
+                    // Create new CppMod — this calls dlopen, loading the new .so
+                    auto new_mod = std::make_unique<CppMod>(*this, std::move(saved_mod_name), ensure_str(saved_mod_path.string()));
+                    CppMod* new_mod_ptr = new_mod.get();
+                    *mod_it = std::move(new_mod);
+
+                    if (!new_mod_ptr->is_installable())
+                    {
+                        Output::send<LogLevel::Error>(STR("Failed to load new C++ mod '{}', library not installable.\n"), new_mod_ptr->get_name());
+                        m_pause_events_processing = false;
+                        return;
+                    }
+
+                    // Mark as installed and re-watch the libs directory
+                    new_mod_ptr->set_installed(true);
+                    filesystem_watcher.add_dir(new_mod_ptr->get_path() / "libs");
+
+                    m_pause_events_processing = false;
+
+                    Output::send(STR("Starting reloaded C++ mod '{}'\n"), new_mod_ptr->get_name());
+#ifdef __linux__
+                    bool ok = ue4ss_with_crash_recovery([&]() { new_mod_ptr->start_mod(); });
+                    if (!ok)
+                    {
+                        Output::send<LogLevel::Error>(STR("C++ mod '{}' crashed during auto-reload startup.\n"), new_mod_ptr->get_name().data());
+                    }
+#else
+                    new_mod_ptr->start_mod();
+#endif
+
+                    // Fire lifecycle events if the mod started successfully
+                    if (new_mod_ptr->is_started())
+                    {
+                        if (Unreal::UnrealInitializer::StaticStorage::bIsInitialized)
+                        {
+                            new_mod_ptr->fire_unreal_init();
+                        }
+                        if (is_program_started())
+                        {
+                            new_mod_ptr->fire_program_start();
+                        }
+                        new_mod_ptr->fire_on_cpp_mods_loaded();
+                    }
                 }
                 else
                 {

@@ -226,6 +226,7 @@ namespace RC
         auto create_simple_console() -> void;
         auto setup_unreal() -> void;
         auto load_unreal_offsets_from_file() -> void;
+        auto load_default_member_offsets() -> void;
         auto share_lua_functions() -> void;
         auto on_program_start() -> void;
         auto setup_unreal_properties() -> void;
