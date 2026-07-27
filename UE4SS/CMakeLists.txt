@@ -205,3 +205,30 @@ set_target_properties(UE4SS PROPERTIES
 # Use the organize_targets function from IDEOrganization.cmake
 # The organize_special_targets function will also handle this target
 organize_targets("^UE4SS$" "RE-UE4SS")
+
+# ---------------------------------------------------------------------------
+# Copy Assets to Output Directory
+# ---------------------------------------------------------------------------
+# Copy essential assets (settings, mods, signatures) alongside the built library
+set(UE4SS_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../assets")
+
+# Post-build: copy assets to output directory
+add_custom_command(TARGET UE4SS POST_BUILD
+    # Copy UE4SS-settings.ini
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${UE4SS_ASSETS_DIR}/UE4SS-settings.ini"
+        "$<TARGET_FILE_DIR:UE4SS>/UE4SS-settings.ini"
+    # Copy Mods directory (standard mods like BPModLoaderMod, ConsoleCommandsMod, etc.)
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${UE4SS_ASSETS_DIR}/Mods"
+        "$<TARGET_FILE_DIR:UE4SS>/Mods"
+    # Copy UE4SS_Signatures directory (for custom signature overrides)
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${UE4SS_ASSETS_DIR}/UE4SS_Signatures"
+        "$<TARGET_FILE_DIR:UE4SS>/UE4SS_Signatures"
+    # Copy LICENSE
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE"
+        "$<TARGET_FILE_DIR:UE4SS>/LICENSE"
+    COMMENT "Copying UE4SS assets to output directory"
+)
