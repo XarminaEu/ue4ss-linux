@@ -914,6 +914,7 @@ namespace RC
 #include <MacroSetter.hpp>
 
                 m_custom_member_variable_layout_loaded = true;
+                Unreal::UnrealInitializer::StaticStorage::bMemberOffsetsLoaded = true;
             }
         }
     }
@@ -1274,6 +1275,7 @@ namespace RC
         UDataTable::MemberOffsets.emplace(STR("UEP_TotalSize"), 0xB0);
 
         m_custom_member_variable_layout_loaded = true;
+        Unreal::UnrealInitializer::StaticStorage::bMemberOffsetsLoaded = true;
     }
 
     auto UE4SSProgram::setup_unreal() -> void

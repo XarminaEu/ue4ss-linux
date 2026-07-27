@@ -55,6 +55,7 @@ namespace RC::Unreal::UnrealInitializer
     bool StaticStorage::bScanFullyCompleted{};
     std::atomic_bool StaticStorage::FNameVerificationStatus{false};
     std::atomic_bool StaticStorage::FNameVerificationStartedUnhooking{false};
+    bool StaticStorage::bMemberOffsetsLoaded{false};
 
     // These globals are explicitly not defined in a header file.
     // This is to force access via getter to catch if/when the game thread id is being used before it's been set.
@@ -1050,16 +1051,23 @@ namespace RC::Unreal::UnrealInitializer
 
 #ifdef __linux__
         // On Linux with stripped binaries, MemberOffsets lookup (std::unordered_map with
-        // wide strings) crashes when iterating GUObjectArray. Skip the entire PostInitialize
-        // (required objects, hooks) and continue with limited functionality.
-        // Lua mods can still start without hooks.
+        // wide strings) crashes when iterating GUObjectArray — UNLESS MemberOffsets were
+        // pre-loaded from MemberVariableLayout.ini or hardcoded defaults.
+        // If MemberOffsets are loaded, proceed with full PostInitialize (hooks, required objects).
+        // Otherwise, skip PostInitialize and continue with limited functionality.
+        if (!StaticStorage::bMemberOffsetsLoaded)
         {
             int32_t ne = linux_get_num_elements();
-            fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has %d elements, skipping PostInitialize (MemberOffsets crash on Linux)\n",
+            fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has %d elements, skipping PostInitialize (no MemberOffsets loaded)\n",
                     ne);
-            fprintf(stderr, "[UE4SS] Linux limited mode: PostInitialize skipped. Mods will have limited functionality.\n");
+            fprintf(stderr, "[UE4SS] Linux limited mode: PostInitialize skipped. Load MemberVariableLayout.ini for full functionality.\n");
             StaticStorage::bIsInitialized = true;
             return;
+        }
+        else
+        {
+            int32_t ne = linux_get_num_elements();
+            fprintf(stderr, "[UE4SS] Linux: MemberOffsets loaded, proceeding with full PostInitialize (GUObjectArray has %d elements)\n", ne);
         }
 #endif
 

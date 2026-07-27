@@ -124,6 +124,9 @@ namespace RC::Unreal::UnrealInitializer
         RC_UE_API static bool bScanFullyCompleted;
         RC_UE_API static std::atomic_bool FNameVerificationStatus;
         RC_UE_API static std::atomic_bool FNameVerificationStartedUnhooking;
+        // Set to true when MemberOffsets are loaded (from MemberVariableLayout.ini or hardcoded).
+        // On Linux, PostInitialize will only run if this is true.
+        RC_UE_API static bool bMemberOffsetsLoaded;
     };
 
     // Returns the address of a symbol exported by any of loaded modules.
