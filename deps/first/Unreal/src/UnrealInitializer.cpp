@@ -1050,24 +1050,35 @@ namespace RC::Unreal::UnrealInitializer
         }
 
 #ifdef __linux__
-        // On Linux with stripped binaries, MemberOffsets lookup (std::unordered_map with
-        // wide strings) crashes when iterating GUObjectArray — UNLESS MemberOffsets were
-        // pre-loaded from MemberVariableLayout.ini or hardcoded defaults.
-        // If MemberOffsets are loaded, proceed with full PostInitialize (hooks, required objects).
-        // Otherwise, skip PostInitialize and continue with limited functionality.
-        if (!StaticStorage::bMemberOffsetsLoaded)
+        // On Linux with stripped binaries, iterating GUObjectArray crashes because:
+        // 1. Objects may not be fully initialized yet (GetNamePrivate() crashes)
+        // 2. FName comparisons with wide strings can crash on stripped binaries
+        // 3. ForEachUObject in PostInitialize also crashes when populating searcher pools
+        // 
+        // Solution: Skip the entire Initialize post-scan section on Linux.
+        // C++ mods and Lua mods will still work, but hooks that depend on finding
+        // specific UObjects (BeginPlay, EndPlay, InitGameState, etc.) won't be available.
+        // ProcessEvent hook is set up via AOB scan earlier, so it should still work.
         {
             int32_t ne = linux_get_num_elements();
-            fprintf(stderr, "[UE4SS] Initialize: GUObjectArray has %d elements, skipping PostInitialize (no MemberOffsets loaded)\n",
-                    ne);
-            fprintf(stderr, "[UE4SS] Linux limited mode: PostInitialize skipped. Load MemberVariableLayout.ini for full functionality.\n");
+            if (!StaticStorage::bMemberOffsetsLoaded)
+            {
+                fprintf(stderr, "[UE4SS] Linux limited mode: No MemberOffsets loaded (GUObjectArray has %d elements)\n", ne);
+            }
+            else
+            {
+                fprintf(stderr, "[UE4SS] Linux: MemberOffsets loaded, GUObjectArray has %d elements\n", ne);
+            }
+            fprintf(stderr, "[UE4SS] Linux: Skipping UObject iteration (crashes on stripped binaries)\n");
+            fprintf(stderr, "[UE4SS] Linux: C++ mods, Lua mods, and ProcessEvent hook are available\n");
+            fprintf(stderr, "[UE4SS] Linux: BeginPlay, EndPlay, InitGameState hooks are NOT available\n");
+            
+            // Skip all the UObject iteration and go directly to PostInitialize
+            // which will set bIsInitialized = true
+            // But we need to skip the ForEachUObject in PostInitialize too, so we
+            // set bIsInitialized here and return early
             StaticStorage::bIsInitialized = true;
             return;
-        }
-        else
-        {
-            int32_t ne = linux_get_num_elements();
-            fprintf(stderr, "[UE4SS] Linux: MemberOffsets loaded, proceeding with full PostInitialize (GUObjectArray has %d elements)\n", ne);
         }
 #endif
 
