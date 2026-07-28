@@ -1,6 +1,10 @@
 name: Linux Release Publisher
 
 on:
+  push:
+    tags:
+      - 'v*-linux-dev'
+      - 'v*-linux'
   workflow_dispatch:
     inputs:
       prerelease:
@@ -23,7 +27,20 @@ jobs:
   build-and-release:
     name: Build and Publish Linux Release
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.ref_name || inputs.tag_name }}
     steps:
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=${{ contains(github.ref_name, '-dev') }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            echo "prerelease=${{ inputs.prerelease }}" >> $GITHUB_OUTPUT
+          fi
+          
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
@@ -70,15 +87,15 @@ jobs:
         id: changelog
         run: |
           # Get the previous release tag
-          PREV_TAG=$(git tag --sort=-creatordate | grep "linux-dev" | grep -v "${{ inputs.tag_name }}" | head -1)
+          PREV_TAG=$(git tag --sort=-creatordate | grep "linux-dev" | grep -v "${{ steps.tag.outputs.tag }}" | head -1)
           if [ -z "$PREV_TAG" ]; then
-            PREV_TAG=$(git tag --sort=-creatordate | grep -v "${{ inputs.tag_name }}" | head -1)
+            PREV_TAG=$(git tag --sort=-creatordate | grep -v "${{ steps.tag.outputs.tag }}" | head -1)
           fi
           echo "Previous tag: ${PREV_TAG:-none}"
           
           # Export for Python
           export PREV_TAG
-          export RELEASE_TAG="${{ inputs.tag_name }}"
+          export RELEASE_TAG="${{ steps.tag.outputs.tag }}"
           export REPO="${{ github.repository }}"
           
           python3 << 'PYEOF'
@@ -209,7 +226,7 @@ jobs:
           cat > release/BUILD_INFO.txt << EOF
           UE4SS Linux Native Build
           ========================
-          Tag: ${{ inputs.tag_name }}
+          Tag: ${{ steps.tag.outputs.tag }}
           Commit: $(git rev-parse HEAD)
           Branch: $(git branch --show-current)
           Build Type: Game__Dev__Linux64
@@ -232,11 +249,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag_name }}
-          prerelease: ${{ inputs.prerelease }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
           target_commitish: linux-native
           body: |
-            ## UE4SS ${{ inputs.tag_name }} — Linux Native Build
+            ## UE4SS ${{ steps.tag.outputs.tag }} — Linux Native Build
             
             ${{ steps.changelog.outputs.CHANGELOG }}
             
